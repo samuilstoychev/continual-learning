@@ -33,17 +33,14 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="class",classes
     device = model._device()
 
     # Initiate possible sources for replay (no replay for 1st task)
+    # NOTE: Those correspond to exact replay, generative replay and current replay
     Exact = Generative = Current = False
     previous_model = None
 
-    # Register starting param-values (needed for "intelligent synapses").
-    if isinstance(model, ContinualLearner) and (model.si_c>0):
-        for n, p in model.named_parameters():
-            if p.requires_grad:
-                n = n.replace('.', '__')
-                model.register_buffer('{}_SI_prev_task'.format(n), p.data.clone())
-
+    # NOTE: We initalise `previous_generator` DURING the first iteration and AFTER the first reference
     # Loop over all tasks.
+    # NOTE: 1 means 'start indexing from 1'. So task goes from 1 to N. 
+    # NOTE: This is TASK_LOOP - iterating over the different TASKS
     for task, train_dataset in enumerate(train_datasets, 1):
 
         # If offline replay-setting, create large database of all tasks so far
@@ -62,16 +59,7 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="class",classes
         else:
             training_dataset = train_dataset
 
-        # Prepare <dicts> to store running importance estimates and param-values before update ("Synaptic Intelligence")
-        if isinstance(model, ContinualLearner) and (model.si_c>0):
-            W = {}
-            p_old = {}
-            for n, p in model.named_parameters():
-                if p.requires_grad:
-                    n = n.replace('.', '__')
-                    W[n] = p.data.clone().zero_()
-                    p_old[n] = p.data.clone()
-
+        # NOTE: The default scenario is 'class'
         # Find [active_classes]
         active_classes = None  # -> for Domain-IL scenario, always all classes are active
         if scenario == "task":
@@ -80,6 +68,7 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="class",classes
         elif scenario == "class":
             # -for Class-IL scenario, create one <list> with active classes of all tasks so far
             active_classes = list(range(classes_per_task * task))
+        # NOTE: for the Class-IL with MNIST --> 5 tasks each with 2 classes = 10 'active' classes in total. 
 
         # Reset state of optimizer(s) for every task (if requested)
         if model.optim_type=="adam_reset":
@@ -100,7 +89,10 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="class",classes
             progress_gen = tqdm.tqdm(range(1, gen_iters+1))
 
         # Loop over all iterations
+        # NOTE: Number of iterations specified in the function arguments. 
         iters_to_use = iters if (generator is None) else max(iters, gen_iters)
+
+        # NOTE: This is the second loop (BATCH_LOOP) - here we iterate over BATCHES. 
         for batch_index in range(1, iters_to_use+1):
 
             # Update # iters left on current data-loader(s) and, if needed, create new one(s)
@@ -110,6 +102,7 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="class",classes
                 # NOTE:  [train_dataset]  is training-set of current task
                 #      [training_dataset] is training-set of current task with stored exemplars added (if requested)
                 iters_left = len(data_loader)
+            # NOTE: Exact will be set to true only if Task-IL selected or `replay` set to 'exact'. 
             if Exact:
                 if scenario=="task":
                     up_to_task = task if replay_mode=="offline" else task-1
@@ -138,22 +131,26 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="class",classes
             if replay_mode=="offline" and scenario=="task":
                 x = y = scores = None
             else:
+                # NOTE: x and y are the training data from the CURRENT task
                 x, y = next(data_loader)                                    #--> sample training data of current task
                 y = y-classes_per_task*(task-1) if scenario=="task" else y  #--> ITL: adjust y-targets to 'active range'
                 x, y = x.to(device), y.to(device)                           #--> transfer them to correct device
                 # If --bce, --bce-distill & scenario=="class", calculate scores of current batch with previous model
+                # NOTE: Not going here either 
                 binary_distillation = hasattr(model, "binaryCE") and model.binaryCE and model.binaryCE_distill
                 if binary_distillation and scenario=="class" and (previous_model is not None):
                     with torch.no_grad():
                         scores = previous_model(x)[:, :(classes_per_task * (task - 1))]
                 else:
+                    # NOTE: At first, scores is defined as None. 
                     scores = None
 
-
+            # NOTE: Not going here
             #####-----REPLAYED BATCH-----#####
             if not Exact and not Generative and not Current:
                 x_ = y_ = scores_ = None   #-> if no replay
-
+            
+            # NOTE: ... or here
             ##-->> Exact Replay <<--##
             if Exact:
                 scores_ = None
@@ -191,7 +188,11 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="class",classes
                             scores_temp = scores_temp[:, (classes_per_task*task_id):(classes_per_task*(task_id+1))]
                             scores_.append(scores_temp)
 
+            # NOTE: At this point we are still inside both the TASK and BATCH loops. 
             ##-->> Generative / Current Replay <<--##
+            # NOTE: I think that current replay is the "bad" replay - replaying from the current distribution 
+            # Recall that: replay_choices = ['offline', 'exact', 'generative', 'none', 'current', 'exemplars']
+            # NOTE: Generative will be set to True ONLY AFTER the first iteration. 
             if Generative or Current:
                 # Get replayed data (i.e., [x_]) -- either current data or use previous generator
                 x_ = x if Current else previous_generator.sample(batch_size)
@@ -200,12 +201,16 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="class",classes
                 # -if there are no task-specific mask, obtain all predicted scores at once
                 if (not hasattr(previous_model, "mask_dict")) or (previous_model.mask_dict is None):
                     with torch.no_grad():
+                        # NOTE: I guess this is the result (or the 'output') from the old 'solver'. 
                         all_scores_ = previous_model(x_)
                 # -depending on chosen scenario, collect relevant predicted scores (per task, if required)
                 if scenario in ("domain", "class") and (
                         (not hasattr(previous_model, "mask_dict")) or (previous_model.mask_dict is None)
                 ):
+                    # NOTE: Get the soft labels. Also notice that the number of classes is actually increasing 
+                    # with the number of tasks. For example, 1 and 2 in task 1 and then 1, 2, 3 and 4 in task 2. 
                     scores_ = all_scores_[:,:(classes_per_task * (task - 1))] if scenario == "class" else all_scores_
+                    # NOTE: And the hard labels
                     _, y_ = torch.max(scores_, dim=1)
                 else:
                     # NOTE: it's possible to have scenario=domain with task-mask (so actually it's the Task-IL scenario)
@@ -236,19 +241,13 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="class",classes
             if batch_index <= iters:
 
                 # Train the main model with this batch
+                # NOTE: What is the meaning of `scores` here actually? It is still None at this point and 
+                # it is not an actual argument of `train_a_batch`
                 loss_dict = model.train_a_batch(x, y, x_=x_, y_=y_, scores=scores, scores_=scores_,
                                                 active_classes=active_classes, task=task, rnt = 1./task)
 
-                # Update running parameter importance estimates in W
-                if isinstance(model, ContinualLearner) and (model.si_c>0):
-                    for n, p in model.named_parameters():
-                        if p.requires_grad:
-                            n = n.replace('.', '__')
-                            if p.grad is not None:
-                                W[n].add_(-p.grad*(p.detach()-p_old[n]))
-                            p_old[n] = p.detach().clone()
-
                 # Fire callbacks (for visualization of training-progress / evaluating performance after each task)
+                # NOTE: `_cb` stands for "callback". 
                 for loss_cb in loss_cbs:
                     if loss_cb is not None:
                         loss_cb(progress, batch_index, loss_dict, task=task)
@@ -276,7 +275,8 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="class",classes
                     if sample_cb is not None:
                         sample_cb(generator, batch_index, task=task)
 
-
+        # NOTE: This bit is still within the TASK_LOOP. That is, it executes after each loop iteration (i.e. after
+        # each task has completed). 
         ##----------> UPON FINISHING EACH TASK...
 
         # Close progres-bar(s)
@@ -284,49 +284,23 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="class",classes
         if generator is not None:
             progress_gen.close()
 
-        # EWC: estimate Fisher Information matrix (FIM) and update term for quadratic penalty
-        if isinstance(model, ContinualLearner) and (model.ewc_lambda>0):
-            # -find allowed classes
-            allowed_classes = list(
-                range(classes_per_task*(task-1), classes_per_task*task)
-            ) if scenario=="task" else (list(range(classes_per_task*task)) if scenario=="class" else None)
-            # -if needed, apply correct task-specific mask
-            if model.mask_dict is not None:
-                model.apply_XdGmask(task=task)
-            # -estimate FI-matrix
-            model.estimate_fisher(training_dataset, allowed_classes=allowed_classes)
-
-        # SI: calculate and update the normalized path integral
-        if isinstance(model, ContinualLearner) and (model.si_c>0):
-            model.update_omega(W, model.epsilon)
-
-        # EXEMPLARS: update exemplar sets
-        if (add_exemplars or use_exemplars) or replay_mode=="exemplars":
-            exemplars_per_class = int(np.floor(model.memory_budget / (classes_per_task*task)))
-            # reduce examplar-sets
-            model.reduce_exemplar_sets(exemplars_per_class)
-            # for each new class trained on, construct examplar-set
-            new_classes = list(range(classes_per_task)) if scenario=="domain" else list(range(classes_per_task*(task-1),
-                                                                                              classes_per_task*task))
-            for class_id in new_classes:
-                # create new dataset containing only all examples of this class
-                class_dataset = SubDataset(original_dataset=train_dataset, sub_labels=[class_id])
-                # based on this dataset, construct new exemplar-set for this class
-                model.construct_exemplar_set(dataset=class_dataset, n=exemplars_per_class)
-            model.compute_means = True
-
         # Calculate statistics required for metrics
+        # NOTE: Those are statistics at a task (not batch) level. 
         for metric_cb in metric_cbs:
             if metric_cb is not None:
                 metric_cb(model, iters, task=task)
 
         # REPLAY: update source for replay
         previous_model = copy.deepcopy(model).eval()
+        # NOTE: VERY IMPORTANT - see how both Generative and previous_generator are initiated AFTER the first cycle. 
+        # That is because the first iteration is 'special' - there is no 'previous' model to remember. 
         if replay_mode == 'generative':
             Generative = True
             previous_generator = copy.deepcopy(generator).eval() if generator is not None else previous_model
+        # NOTE: Not applicable
         elif replay_mode == 'current':
             Current = True
+        # NOTE: Not applicable
         elif replay_mode in ('exemplars', 'exact'):
             Exact = True
             if replay_mode == "exact":
